@@ -34,7 +34,7 @@ from ctypes import POINTER, byref, c_double, c_char_p, c_int, c_ubyte, c_uint, c
 from functools import lru_cache
 from io import BytesIO
 
-VERSION = "1.6"
+VERSION = "1.7"
 NOM_PAQUET = "ma-voix"
 
 DEPOT = "jbandrivet/ma-voix"
@@ -698,9 +698,11 @@ class Tactile:
             x.XNextEvent(d, byref(e))
             c = e.xcookie
             if c.type == GENERIC_EVENT and c.extension == self.opcode and x.XGetEventData(d, byref(c)):
-                if XI_RAW_BEGIN <= c.evtype <= XI_RAW_END:
-                    self._brut(c.evtype, ctypes.cast(c.data, POINTER(XIRawEvent)).contents)
-                x.XFreeEventData(d, byref(c))
+                try:
+                    if XI_RAW_BEGIN <= c.evtype <= XI_RAW_END:
+                        self._brut(c.evtype, ctypes.cast(c.data, POINTER(XIRawEvent)).contents)
+                finally:
+                    x.XFreeEventData(d, byref(c))
 
     def _brut(self, quoi, t):
         pos = self.positions.setdefault(t.detail, [0.0, 0.0])
@@ -727,8 +729,9 @@ class Tactile:
         if doigt == self.doigt:
             self.depuis = maintenant
         if quoi == XI_TOUCH_BEGIN and self.doigt is None:
-            w = self.root.winfo_containing(rx, ry)
-            if w is None or not self.nous_sommes_devant():
+            # Par son nom Tcl : les boîtes de message et les listes déroulantes n'existent pas côté Python
+            w = str(self.root.tk.call("winfo", "containing", rx, ry))
+            if not w or not self.nous_sommes_devant():
                 return
             self.doigt, self.cible, self.depuis = doigt, w, maintenant
             self._envoyer("<Motion>", rx, ry, 0)
@@ -740,10 +743,11 @@ class Tactile:
             self.doigt = self.cible = None
 
     def _envoyer(self, sequence, rx, ry, etat):
+        tcl = self.root.tk.call
         w = self.cible
         try:
-            w.event_generate(sequence, x=rx - w.winfo_rootx(), y=ry - w.winfo_rooty(),
-                             rootx=rx, rooty=ry, state=etat)
+            tcl("event", "generate", w, sequence, "-x", rx - int(tcl("winfo", "rootx", w)),
+                "-y", ry - int(tcl("winfo", "rooty", w)), "-rootx", rx, "-rooty", ry, "-state", etat)
         except tk.TclError:             # le widget a disparu entre-temps
             self.doigt = self.cible = None
 
