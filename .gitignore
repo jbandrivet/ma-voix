@@ -1,0 +1,4 @@
+*.deb
+__pycache__/
+voix/*.onnx
+voix/*.tmp
