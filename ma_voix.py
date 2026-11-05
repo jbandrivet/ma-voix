@@ -34,7 +34,7 @@ from ctypes import POINTER, byref, c_double, c_char_p, c_int, c_ubyte, c_uint, c
 from functools import lru_cache
 from io import BytesIO
 
-VERSION = "1.5"
+VERSION = "1.6"
 NOM_PAQUET = "ma-voix"
 
 DEPOT = "jbandrivet/ma-voix"
@@ -565,12 +565,15 @@ from tkinter import messagebox, ttk  # noqa: E402
 
 # ---------------------------------------------------------------- toucher
 
-# Sous Wayland, GNOME écoute les touchers sur le cadre des fenêtres X11. Un programme Tk ne
-# reçoit donc que les déplacements du doigt, jamais l'appui. On demande les touchers avec
-# XInput 2 sur la fenêtre de Tk, devant le cadre, et on les transforme en clics pour Tk.
-# Si quelque chose manque, on ne fait rien : la souris et le reste marchent comme avant.
+# Sous Wayland, un programme Tk ne reçoit jamais l'appui du doigt. Mesuré sur une Surface Pro 3 :
+# le premier doigt n'arrive ni comme clic ni comme toucher sur la fenêtre, seul le deuxième passe.
+# Seuls les touchers bruts d'XInput 2 voient tous les doigts : on les écoute à la racine de
+# l'écran et on les transforme en clics pour Tk. Hors Wayland, le tactile marche tout seul et
+# on ne fait rien, sinon chaque appui compterait double.
 
 XI_TOUCH_BEGIN, XI_TOUCH_UPDATE, XI_TOUCH_END = 18, 19, 20
+XI_RAW_BEGIN, XI_RAW_UPDATE, XI_RAW_END = 22, 23, 24
+ECHELLE_XWAYLAND = 65535.0      # Xwayland donne la position du doigt de 0 à 65535 sur tout l'écran
 XI_ALL_MASTER_DEVICES = 1
 DOIGT_PERDU = 8.0       # s : plus long que l'appui de 5 s qui ouvre les réglages
 GENERIC_EVENT = 35
@@ -598,11 +601,23 @@ class XIDeviceEvent(ctypes.Structure):
                 ("event_x", c_double), ("event_y", c_double), ("flags", c_int)]
 
 
+class XIValuatorState(ctypes.Structure):
+    _fields_ = [("mask_len", c_int), ("mask", POINTER(c_ubyte)), ("values", POINTER(c_double))]
+
+
+class XIRawEvent(ctypes.Structure):
+    _fields_ = [("type", c_int), ("serial", c_ulong), ("send_event", c_int), ("display", c_void_p),
+                ("extension", c_int), ("evtype", c_int), ("time", c_ulong), ("deviceid", c_int),
+                ("sourceid", c_int), ("detail", c_int), ("flags", c_int), ("valuators", XIValuatorState),
+                ("raw_values", POINTER(c_double))]
+
+
 class Tactile:
     def __init__(self, root):
         self.root = root
         self.doigt = None       # le premier doigt posé ; les autres sont ignorés
         self.depuis = 0.0
+        self.positions = {}     # dernière position de chaque doigt : un toucher brut ne redit que ce qui change
         self.cible = None
         self.actif = False
         try:
@@ -624,6 +639,8 @@ class Tactile:
         x.XConnectionNumber.argtypes = [c_void_p]
         xi.XIQueryVersion.argtypes = [c_void_p, POINTER(c_int), POINTER(c_int)]
         xi.XISelectEvents.argtypes = [c_void_p, c_ulong, POINTER(XIEventMask), c_int]
+        x.XDefaultRootWindow.restype = c_ulong
+        x.XDefaultRootWindow.argtypes = [c_void_p]
         self.x = x
         d = self.d = x.XOpenDisplay(None)
         if not d:
@@ -636,12 +653,15 @@ class Tactile:
         if xi.XIQueryVersion(d, byref(maj), byref(mi)) != 0 or (maj.value, mi.value) < (2, 2):
             raise OSError("XInput trop ancien")
 
+        if not (os.environ.get("WAYLAND_DISPLAY")
+                or x.XQueryExtension(d, b"XWAYLAND", byref(op), byref(ev), byref(er))):
+            return
         self.xi = xi
         self.fenetres = set()
         self.root.update_idletasks()
-        self.abonner(self.root)
-        if not self.fenetres:
+        if not self._selectionner(x.XDefaultRootWindow(d), (XI_RAW_BEGIN, XI_RAW_UPDATE, XI_RAW_END)):
             raise OSError("abonnement refusé")
+        self.abonner(self.root)
         self.actif = True
         # Les fenêtres de dialogue s'abonnent en s'ouvrant
         self.root.bind_class("Toplevel", "<Map>", lambda e: self.abonner(e.widget.winfo_toplevel()), add="+")
@@ -649,10 +669,12 @@ class Tactile:
         self._lire()
 
     def abonner(self, fenetre):
-        """S'abonne sur la fenêtre de Tk elle-même : devant le cadre, que GNOME écoute déjà."""
+        """Prend les touchers de la fenêtre, sans s'en servir : le système ne les change plus en clics."""
         fid = fenetre.winfo_id()
-        if fid in self.fenetres:
-            return
+        if fid not in self.fenetres and self._selectionner(fid, (XI_TOUCH_BEGIN, XI_TOUCH_UPDATE, XI_TOUCH_END)):
+            self.fenetres.add(fid)
+
+    def _selectionner(self, fid, evenements):
         x, d = self.x, self.d
         # Une erreur X tuerait le programme : on l'attrape le temps de s'abonner
         erreurs = []
@@ -660,15 +682,14 @@ class Tactile:
         x.XSetErrorHandler.restype = c_void_p
         x.XSetErrorHandler.argtypes = [c_void_p]
         ancien = x.XSetErrorHandler(ctypes.cast(rappel, c_void_p))
-        octets = (c_ubyte * 3)()
-        for t in (XI_TOUCH_BEGIN, XI_TOUCH_UPDATE, XI_TOUCH_END):
+        octets = (c_ubyte * 4)()
+        for t in evenements:
             octets[t >> 3] |= 1 << (t & 7)
-        masque = XIEventMask(XI_ALL_MASTER_DEVICES, 3, ctypes.cast(octets, POINTER(c_ubyte)))
+        masque = XIEventMask(XI_ALL_MASTER_DEVICES, 4, ctypes.cast(octets, POINTER(c_ubyte)))
         self.xi.XISelectEvents(d, fid, byref(masque), 1)
         x.XSync(d, 0)
         x.XSetErrorHandler(ancien)
-        if not erreurs:
-            self.fenetres.add(fid)
+        return not erreurs
 
     def _lire(self, *_):
         x, d = self.x, self.d
@@ -677,9 +698,27 @@ class Tactile:
             x.XNextEvent(d, byref(e))
             c = e.xcookie
             if c.type == GENERIC_EVENT and c.extension == self.opcode and x.XGetEventData(d, byref(c)):
-                t = ctypes.cast(c.data, POINTER(XIDeviceEvent)).contents
-                self._toucher(c.evtype, t.detail, int(t.root_x), int(t.root_y))
+                if XI_RAW_BEGIN <= c.evtype <= XI_RAW_END:
+                    self._brut(c.evtype, ctypes.cast(c.data, POINTER(XIRawEvent)).contents)
                 x.XFreeEventData(d, byref(c))
+
+    def _brut(self, quoi, t):
+        pos = self.positions.setdefault(t.detail, [0.0, 0.0])
+        rang = 0
+        for axe in range(t.valuators.mask_len * 8):
+            if t.valuators.mask[axe >> 3] & (1 << (axe & 7)):
+                if axe < 2:
+                    pos[axe] = t.valuators.values[rang]
+                rang += 1
+        rx = int(pos[0] / ECHELLE_XWAYLAND * self.root.winfo_screenwidth())
+        ry = int(pos[1] / ECHELLE_XWAYLAND * self.root.winfo_screenheight())
+        if quoi == XI_RAW_END:
+            del self.positions[t.detail]
+        self._toucher(quoi - XI_RAW_BEGIN + XI_TOUCH_BEGIN, t.detail, rx, ry)
+
+    def nous_sommes_devant(self):
+        """Les touchers bruts viennent de tout l'écran, y compris des autres logiciels."""
+        return bool(self.root.tk.call("focus", "-displayof", ".")) or bool(self.root.attributes("-fullscreen"))
 
     def _toucher(self, quoi, doigt, rx, ry):
         maintenant = time.monotonic()
@@ -689,7 +728,7 @@ class Tactile:
             self.depuis = maintenant
         if quoi == XI_TOUCH_BEGIN and self.doigt is None:
             w = self.root.winfo_containing(rx, ry)
-            if w is None:
+            if w is None or not self.nous_sommes_devant():
                 return
             self.doigt, self.cible, self.depuis = doigt, w, maintenant
             self._envoyer("<Motion>", rx, ry, 0)
