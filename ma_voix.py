@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Ma Voix : parler avec des symboles.
 
-Pour une personne qui ne peut ni parler ni écrire. L'écran ne montre aucun mot :
-seulement de grands symboles. Un choix = une phrase dite à voix haute.
+Pour une personne qui ne peut ni parler ni écrire. Par défaut, l'écran ne montre aucun mot :
+seulement de grands symboles (l'aidant peut faire écrire les phrases dessous). Un choix = une phrase dite à voix haute.
 Se pilote au toucher, en restant sur un symbole, ou avec un ou deux contacts
 (le cadre orange défile, comme dans ACAT d'Intel).
 
@@ -18,6 +18,7 @@ import json
 import math
 import os
 import queue
+import re
 import shutil
 import struct
 import subprocess
@@ -31,8 +32,13 @@ import wave
 from functools import lru_cache
 from io import BytesIO
 
-VERSION = "1.1"
+VERSION = "1.4"
 NOM_PAQUET = "ma-voix"
+
+DEPOT = "jbandrivet/ma-voix"
+URL_DERNIERE = f"https://api.github.com/repos/{DEPOT}/releases/latest"
+PAGE_VERSIONS = f"https://github.com/{DEPOT}/releases/latest"
+CHEMIN_PROGRAMME = f"/usr/bin/{NOM_PAQUET}"
 
 ICI = os.path.dirname(os.path.abspath(__file__))
 
@@ -91,11 +97,13 @@ NOMS_TOUCHES = {"space": "Espace", "Return": "Entrée", "Tab": "Tabulation", "Ba
 REGLAGES = {
     "mode": "direct", "vitesse": 2.5, "balayage": "case", "scan_voix": False,
     "attente": 1.5, "anti_rebond": 0.4, "touche_a": "space", "touche_b": "Return",
-    "colonnes": 3, "lignes": 3, "affichage": 2.0, "retour_accueil": True, "plein_ecran": True,
+    "colonnes": 3, "lignes": 3, "ecrire": False, "affichage": 2.0, "retour_accueil": True, "plein_ecran": True,
     "voix": "siwis", "genre": "m", "lenteur": 1.3, "volume": 100, "premier_lancement": True,
 }
 TOURS_AVANT_ACCUEIL = 3     # tours de défilement sans choix avant de revenir à l'accueil
 DUREE_COIN = 5000           # ms d'appui en haut à droite pour ouvrir les réglages
+DELAI_ARRET = 2000          # ms avant de pouvoir couper l'alarme : des appuis répétés dans la panique
+                            # ne doivent pas couper l'appel à l'aide
 
 
 # ---------------------------------------------------------------- données
@@ -354,10 +362,12 @@ class Voix:
                     sortie = os.path.join(self.temp, f"{g}.wav")
                     regler_volume(f, gain, sortie)
                     f = sortie
-            suite = [self.alarme, f, self.alarme, f] if alarme else [f]
-            for s in suite:
-                if s and not self._jouer(s, g):
-                    break
+            if alarme:
+                # Sonne jusqu'à ce qu'on l'arrête : sinon l'appel se perd si personne n'est là
+                while self._jouer(self.alarme, g) and (not f or self._jouer(f, g)):
+                    time.sleep(0.8)
+            elif f:
+                self._jouer(f, g)
         finally:
             if g == self.gen:
                 self.occupe = False
@@ -395,7 +405,7 @@ def preparer_sons(dossier):
 
 # ---------------------------------------------------------------- dessin
 
-from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageOps, ImageTk  # noqa: E402
+from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageFont, ImageOps, ImageTk  # noqa: E402
 
 
 def rgb(c):
@@ -438,8 +448,39 @@ def chemin_image(nom):
     return nom if os.path.isabs(nom) else os.path.join(SYMBOLES, nom)
 
 
-def rendu_case(item, w, h, actif=False):
-    """Bouton brillant façon Clearlooks avec son symbole."""
+@lru_cache(maxsize=32)
+def police(taille):
+    try:
+        return ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", taille)
+    except OSError:
+        return ImageFont.load_default()
+
+
+def couper_texte(texte, largeur, f):
+    lignes, ligne = [], ""
+    for mot in texte.split():
+        essai = f"{ligne} {mot}".strip()
+        if ligne and f.getlength(essai) > largeur:
+            lignes.append(ligne)
+            ligne = mot
+        else:
+            ligne = essai
+    return lignes + [ligne]
+
+
+def ajuster_texte(texte, largeur, grand):
+    """La plus grande police qui tient sur deux lignes."""
+    taille = grand
+    while True:
+        f = police(taille)
+        lignes = couper_texte(texte, largeur, f)
+        if taille <= 12 or (len(lignes) <= 2 and all(f.getlength(x) <= largeur for x in lignes)):
+            return f, taille, lignes
+        taille -= 2
+
+
+def rendu_case(item, w, h, actif=False, texte=None):
+    """Bouton brillant façon Clearlooks avec son symbole, et sa phrase écrite si on la veut."""
     dossier = bool(item.get("page"))
     teinte = item.get("couleur") or ("dossier" if dossier else None)
     if item.get("alarme"):
@@ -470,10 +511,20 @@ def rendu_case(item, w, h, actif=False):
 
     marge = max(10, min(bw, bh) // 18) + max(8, min(bw, bh) // 20)   # le symbole ne bouge pas sous le cadre
     haut_img = marge + (max(10, bh // 11) if dossier else 0)
-    p = picto(chemin_image(item["image"]), bw - 2 * marge, bh - marge - haut_img)
+    bas_img = marge
+    if texte:
+        f, taille, lignes = ajuster_texte(texte, bw - 2 * (bord + 10), max(14, min(64, bh // 7)))
+        pas = int(taille * 1.2)
+        bas_img = bord + 8 + pas * len(lignes) + 6
+    p = picto(chemin_image(item["image"]), bw - 2 * marge, bh - bas_img - haut_img)
     x = (bw - p.width) // 2
-    y = haut_img + (bh - marge - haut_img - p.height) // 2
+    y = haut_img + (bh - bas_img - haut_img - p.height) // 2
     im.alpha_composite(p, (x, y))
+    if texte:
+        d = ImageDraw.Draw(im)
+        for i, ligne in enumerate(lignes):
+            d.text(((bw - f.getlength(ligne)) / 2, bh - bord - 8 - pas * (len(lignes) - i)), ligne,
+                   font=f, fill=rgb(FG))
     return im
 
 
@@ -531,6 +582,9 @@ def style_human(root):
     st.configure("TLabelframe.Label", background=BG, font=("DejaVu Sans", 10, "bold"))
     st.configure("Note.TLabel", foreground="#6B5D4D")
     st.configure("Alerte.TLabel", foreground="#A40000")
+    st.configure("Maj.TButton", background=SEL, foreground="#FFFFFF", bordercolor="#B85F15")
+    st.map("Maj.TButton", background=[("pressed", "#B85F15"), ("active", "#F09A50")],
+           foreground=[("active", "#FFFFFF")])
 
 
 class Appli:
@@ -559,6 +613,8 @@ class Appli:
         self.job_scan = self.job_taille = self.job_coin = self.job_att = self.job_fin = None
         self.groupes, self.gi, self.tours, self.sous_groupe = [], 0, 0, False
         self.att_i, self.att_t0 = None, 0.0
+        self.arret = None           # rectangle de la maison qui coupe l'alarme, quand elle est là
+        self.job_arret = self.job_arret_att = None
 
         self.canvas.bind("<Configure>", self._sur_taille)
         self.canvas.bind("<ButtonPress>", self._appui)
@@ -575,6 +631,9 @@ class Appli:
             self.root.after(200, self.ouvrir_reglages)
         else:
             self.root.after(100, self.afficher, "accueil")
+
+    def dessin(self, it, w, h, actif=False):
+        return rendu_case(it, w, h, actif, phrase(it, self.r) if self.r["ecrire"] else None)
 
     def plein_ecran(self, oui):
         self.root.attributes("-fullscreen", bool(oui))
@@ -647,6 +706,7 @@ class Appli:
             return
         self._annuler_scan()
         self._attente_zero()
+        self._oublier_arret()
         if page is not None:
             self.page, self.tranche = page, tranche
             self.image_page = image
@@ -659,7 +719,7 @@ class Appli:
             if it is None:
                 continue
             x, y, cw, ch = self.rectangle_case(i)
-            self.photos[i, False] = ImageTk.PhotoImage(rendu_case(it, cw, ch))
+            self.photos[i, False] = ImageTk.PhotoImage(self.dessin(it, cw, ch))
             self.ids[i] = self.canvas.create_image(x, y, anchor="nw", image=self.photos[i, False])
         self.demarrer_scan()
 
@@ -681,7 +741,7 @@ class Appli:
         for i in self.marques:
             if (i, True) not in self.photos:
                 _x, _y, cw, ch = self.rectangle_case(i)
-                self.photos[i, True] = ImageTk.PhotoImage(rendu_case(self.cases[i], cw, ch, actif=True))
+                self.photos[i, True] = ImageTk.PhotoImage(self.dessin(self.cases[i], cw, ch, actif=True))
             self.canvas.itemconfigure(self.ids[i], image=self.photos[i, True])
 
     # ---- choix
@@ -708,13 +768,48 @@ class Appli:
         self.ids, self.marques = {}, []
         self.dessiner_bandeau()
         cw, ch = W - 2 * m, H - bh - 2 * m
+        if it.get("alarme"):
+            # place gardée dès le début : le symbole ne bouge pas quand la maison arrive
+            cw -= self.rectangle_arret()[2] + m
+            self.job_arret = self.root.after(DELAI_ARRET, self._montrer_arret)
         rendu = dict(it)
         rendu.pop("page", None)
-        self.photos["grand"] = ImageTk.PhotoImage(rendu_case(rendu, cw, ch))
+        self.photos["grand"] = ImageTk.PhotoImage(self.dessin(rendu, cw, ch))
         self.canvas.create_image(m, bh + m, anchor="nw", image=self.photos["grand"])
         self.voix.dire(phrase(it, self.r), alarme=bool(it.get("alarme")))
-        self.limite_voix = time.monotonic() + 30
-        self.root.after(100, self._attendre_voix)
+        if not it.get("alarme"):        # l'alarme reste à l'écran jusqu'à l'appui sur la maison
+            self.limite_voix = time.monotonic() + 30
+            self.root.after(100, self._attendre_voix)
+
+    def rectangle_arret(self):
+        W, H, bh, m, *_ = self.geometrie()
+        w, h = W // 4, (H - bh) // 3 - m
+        return W - m - w, H - m - h, w, h
+
+    def _montrer_arret(self):
+        self.job_arret = None
+        x, y, w, h = self.arret = self.rectangle_arret()
+        self.photos["arret"] = ImageTk.PhotoImage(self.dessin(dict(RETOUR, texte="Arrêter"), w, h, actif=True))
+        self.canvas.create_image(x, y, anchor="nw", image=self.photos["arret"])
+
+    def dans_arret(self, x, y):
+        ax, ay, aw, ah = self.arret
+        return ax <= x < ax + aw and ay <= y < ay + ah
+
+    def _oublier_arret(self):
+        for job in (self.job_arret, self.job_arret_att):
+            if job:
+                self.root.after_cancel(job)
+        self.job_arret = self.job_arret_att = self.arret = None
+
+    def arreter(self):
+        """Coupe l'alarme et revient à l'accueil."""
+        self.voix.stop()
+        if self.job_fin:
+            self.root.after_cancel(self.job_fin)
+            self.job_fin = None
+        self.dernier_contact = time.monotonic()     # ce même appui ne choisit rien à l'accueil
+        self.afficher("accueil")
 
     def _attendre_voix(self):
         if self.panneau is not None or not self.confirmation:
@@ -793,6 +888,9 @@ class Appli:
 
     def contact(self, quoi):
         """quoi : 'A' pour le premier contact, 'B' pour le second, None pour tout le reste."""
+        if self.panneau is None and self.arret and self.r["mode"] in ("un", "deux") and quoi:
+            self.arreter()
+            return
         if self.panneau is not None or self.confirmation:
             return
         maintenant = time.monotonic()
@@ -816,6 +914,9 @@ class Appli:
             return
         if self.r["mode"] in ("un", "deux"):
             self.contact("B" if e.num == 3 else "A")
+            return
+        if self.arret and e.num == 1 and self.dans_arret(e.x, e.y):
+            self.arreter()
             return
         if self.confirmation or e.num != 1:
             return
@@ -859,6 +960,14 @@ class Appli:
     # ---- choisir sans cliquer
 
     def _mouvement(self, e):
+        if self.r["mode"] == "attente" and self.arret and self.panneau is None:
+            dedans = self.dans_arret(e.x, e.y)
+            if dedans and not self.job_arret_att:
+                self.job_arret_att = self.root.after(int(self.r["attente"] * 1000), self.arreter)
+            elif not dedans and self.job_arret_att:
+                self.root.after_cancel(self.job_arret_att)
+                self.job_arret_att = None
+            return
         if self.r["mode"] != "attente" or self.confirmation or self.panneau is not None:
             return
         i = self.case_en(e.x, e.y)
@@ -903,6 +1012,7 @@ class Appli:
         self._relache(None)
         self._annuler_scan()
         self._attente_zero()
+        self._oublier_arret()
         self.voix.stop()
         if self.job_fin:
             self.root.after_cancel(self.job_fin)
@@ -931,9 +1041,15 @@ class Appli:
         self.voix.stop()
         self.root.destroy()
 
+    def relancer(self):
+        """Repart sur la nouvelle version. Le verrou se libère tout seul avec l'ancien programme."""
+        self.quitter()
+        shutil.rmtree(self.voix.temp, ignore_errors=True)
+        os.execv(CHEMIN_PROGRAMME, [CHEMIN_PROGRAMME])
+
 
 class Reglages(ttk.Frame):
-    """Réglages pour l'aidant : c'est le seul endroit du logiciel où il y a des mots."""
+    """Réglages pour l'aidant : le seul endroit avec des mots, sauf si l'aidant les demande aussi à l'écran."""
 
     def __init__(self, parent, app):
         super().__init__(parent)
@@ -953,6 +1069,13 @@ class Reglages(ttk.Frame):
         bas.pack(side="bottom", fill="x")
         ttk.Button(bas, text="Quitter le logiciel", command=app.quitter).pack(side="left")
         ttk.Button(bas, text="Revenir aux symboles", command=app.fermer_reglages).pack(side="right")
+        self.maj = None
+        self.q_maj = queue.Queue()
+        self.b_maj = ttk.Button(bas, text="Chercher une mise à jour", command=self.clic_maj)
+        self.b_maj.pack(side="left", padx=(16, 8))
+        self.l_maj = ttk.Label(bas, text=f"Version {VERSION}", style="Note.TLabel")
+        self.l_maj.pack(side="left")
+        self.verifier_maj(discret=True)
 
         nb = ttk.Notebook(self)
         nb.pack(fill="both", expand=True, padx=10, pady=(6, 0))
@@ -961,6 +1084,50 @@ class Reglages(ttk.Frame):
         nb.add(self.onglet_voix(nb), text="Voix")
         nb.add(Editeur(nb, app), text="Symboles")
         nb.add(self.onglet_apropos(nb), text="À propos")
+
+    def verifier_maj(self, discret=False):
+        self.b_maj.state(["disabled"])
+        if not discret:
+            self.l_maj.configure(text="Vérification…")
+
+        def travail():
+            try:
+                self.q_maj.put(("fait", chercher_maj()))
+            except (OSError, ValueError, KeyError):
+                self.q_maj.put(("erreur", None))
+        threading.Thread(target=travail, daemon=True).start()
+        self.after(150, self._lire_maj, discret)
+
+    def _lire_maj(self, discret):
+        if self.app.panneau is not self:
+            return
+        try:
+            quoi, info = self.q_maj.get_nowait()
+        except queue.Empty:
+            self.after(150, self._lire_maj, discret)
+            return
+        self.b_maj.state(["!disabled"])
+        self.maj = info
+        if info:
+            self.b_maj.configure(text="Mettre à jour", style="Maj.TButton")
+            self.l_maj.configure(text=f"Version {info['version']} disponible (vous avez la {VERSION})")
+        else:
+            self.b_maj.configure(text="Chercher une mise à jour", style="TButton")
+            if quoi == "erreur":
+                self.l_maj.configure(text=f"Version {VERSION}" if discret else "Pas d'accès à internet")
+            else:
+                self.l_maj.configure(text=f"Version {VERSION} : à jour")
+
+    def clic_maj(self):
+        if not self.maj:
+            self.verifier_maj()
+        elif installation_possible():
+            FenetreMaj(self)
+        else:
+            messagebox.showinfo(
+                "Mise à jour", "Ce système ne peut pas installer tout seul la mise à jour.\n"
+                "La page de téléchargement va s'ouvrir.", parent=self)
+            subprocess.Popen(["xdg-open", PAGE_VERSIONS], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
     def changer(self, cle, valeur):
         self.r[cle] = valeur
@@ -1045,6 +1212,7 @@ class Reglages(ttk.Frame):
             self.app.sauver()
         for co, li, nom in GRILLES:
             ttk.Radiobutton(l3, text=nom, value=f"{co}x{li}", variable=g, command=grille).pack(side="left", padx=(0, 10))
+        self.case_a_cocher(d, "Écrire la phrase sous chaque symbole", "ecrire")
         self.case_a_cocher(d, "Revenir à l'accueil après chaque phrase", "retour_accueil")
         self.case_a_cocher(d, "Plein écran", "plein_ecran")
         v2 = tk.BooleanVar(value=os.path.exists(F_AUTOSTART))
@@ -1362,6 +1530,128 @@ def lire_url(url):
     req = urllib.request.Request(url, headers={"User-Agent": "ma-voix"})
     with urllib.request.urlopen(req, timeout=15) as r:
         return r.read()
+
+
+def numero(version):
+    return tuple(int(x) for x in re.findall(r"\d+", version))
+
+
+def chercher_maj():
+    """Rend ce qu'il faut pour installer une version plus récente, ou None si on est à jour."""
+    d = json.loads(lire_url(URL_DERNIERE))
+    version = d["tag_name"].lstrip("v")
+    if numero(version) <= numero(VERSION):
+        return None
+    for a in d.get("assets", []):
+        if re.fullmatch(r"ma-voix(_[\d.]+)?_amd64\.deb", a["name"]):
+            return {"version": version, "nom": a["name"], "url": a["browser_download_url"],
+                    "empreinte": (a.get("digest") or "").replace("sha256:", "")}
+    return None
+
+
+def installation_possible():
+    return (os.path.realpath(sys.argv[0]) == CHEMIN_PROGRAMME
+            and all(os.path.exists(c) for c in ("/usr/bin/pkexec", "/usr/bin/apt-get")))
+
+
+def telecharger(info, dossier, avancement):
+    """Télécharge le paquet et vérifie qu'il est bien celui annoncé par GitHub."""
+    chemin = os.path.join(dossier, info["nom"])
+    req = urllib.request.Request(info["url"], headers={"User-Agent": "ma-voix"})
+    h = hashlib.sha256()
+    with urllib.request.urlopen(req, timeout=30) as r, open(chemin, "wb") as f:
+        total, recu = int(r.headers.get("Content-Length") or 0), 0
+        while True:
+            bloc = r.read(1 << 18)
+            if not bloc:
+                break
+            f.write(bloc)
+            h.update(bloc)
+            recu += len(bloc)
+            if total:
+                avancement(100 * recu / total)
+    if info["empreinte"] and h.hexdigest() != info["empreinte"]:
+        os.remove(chemin)
+        raise ValueError("fichier abîmé")
+    os.chmod(chemin, 0o644)         # apt le lit avec son propre utilisateur
+    return chemin
+
+
+class FenetreMaj(tk.Toplevel):
+    """Télécharge et installe, puis relance le logiciel."""
+
+    def __init__(self, reglages):
+        super().__init__(reglages)
+        self.app = reglages.app
+        self.title("Mise à jour de Ma Voix")
+        self.configure(bg=BG)
+        self.geometry("440x130")
+        self.resizable(False, False)
+        self.transient(reglages.winfo_toplevel())
+        self.protocol("WM_DELETE_WINDOW", lambda: None)     # on ne coupe pas une installation
+        self.q = queue.Queue()
+        c = ttk.Frame(self, padding=16)
+        c.pack(fill="both", expand=True)
+        self.texte = ttk.Label(c, text="Vérification…")
+        self.texte.pack(anchor="w")
+        self.barre = ttk.Progressbar(c, maximum=100)
+        self.barre.pack(fill="x", pady=(10, 0))
+        self.fermer = ttk.Button(c, text="Fermer", command=self.destroy)
+        threading.Thread(target=self._travail, daemon=True).start()
+        self.after(100, self._lire)
+
+    def _travail(self):
+        dossier = tempfile.mkdtemp(prefix="ma-voix-maj-")
+        os.chmod(dossier, 0o755)
+        try:
+            info = chercher_maj()           # on revérifie : la version a pu changer entre-temps
+            if not info:
+                self.q.put(("fin", "Ma Voix est déjà à jour."))
+                return
+            self.q.put(("texte", f"Téléchargement de la version {info['version']}…"))
+            deb = telecharger(info, dossier, lambda p: self.q.put(("avance", p)))
+            self.q.put(("texte", "Installation : entrez le mot de passe administrateur…"))
+            self.q.put(("attente", None))
+            rc = subprocess.run(["/usr/bin/pkexec", "/usr/bin/apt-get", "install", "-y", deb],
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode
+            if rc == 0:
+                self.q.put(("relance", None))
+            elif rc in (126, 127):
+                self.q.put(("fin", "Mise à jour annulée : mot de passe non donné."))
+            else:
+                self.q.put(("fin", "L'installation a échoué. Le logiciel reste dans sa version actuelle."))
+        except ValueError:
+            self.q.put(("fin", "Le fichier reçu est abîmé. Rien n'a été installé."))
+        except (OSError, KeyError):
+            self.q.put(("fin", "Pas d'accès à internet. Rien n'a été installé."))
+        finally:
+            shutil.rmtree(dossier, ignore_errors=True)
+
+    def _lire(self):
+        try:
+            while True:
+                quoi, v = self.q.get_nowait()
+                if quoi == "texte":
+                    self.texte.configure(text=v)
+                elif quoi == "avance":
+                    self.barre.configure(value=v)
+                elif quoi == "attente":
+                    self.barre.configure(mode="indeterminate")
+                    self.barre.start(40)
+                elif quoi == "relance":
+                    self.texte.configure(text="Installé. Le logiciel redémarre…")
+                    self.after(1200, self.app.relancer)
+                    return
+                else:
+                    self.barre.stop()
+                    self.barre.pack_forget()
+                    self.texte.configure(text=v, wraplength=400)
+                    self.fermer.pack(side="bottom", anchor="e", pady=(10, 0))
+                    self.protocol("WM_DELETE_WINDOW", self.destroy)
+                    return
+        except queue.Empty:
+            pass
+        self.after(100, self._lire)
 
 
 class ChoixImage(tk.Toplevel):

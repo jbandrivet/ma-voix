@@ -65,6 +65,8 @@ mais n'en contient aucun code et n'est ni lié à Intel ni approuvé par Intel.
 COPY
 
 TAILLE=$(du -sk "$R/usr" | cut -f1)
+# python3-onnxruntime : obligatoire là où il existe. Il manque aux systèmes à Python ancien (Ubuntu 24.04) :
+# l'alternative laisse l'installation passer, et seules les phrases ajoutées auront la voix de robot.
 cat > "$R/DEBIAN/control" <<CTRL
 Package: $PKG
 Version: $VERSION
@@ -72,7 +74,7 @@ Section: misc
 Priority: optional
 Architecture: amd64
 Installed-Size: $TAILLE
-Depends: python3 (>= 3.9), python3-tk, python3-pil, python3-pil.imagetk, espeak-ng, alsa-utils
+Depends: python3 (>= 3.9), python3-tk, python3-pil, python3-pil.imagetk, espeak-ng, alsa-utils, fonts-dejavu-core, python3-onnxruntime | python3 (<< 3.13)
 Recommends: python3-onnxruntime, xdg-user-dirs
 Maintainer: Jean-Baptiste Andrivet <146567424+jbandrivet@users.noreply.github.com>
 Description: Parler avec des symboles, sans lire ni écrire
