@@ -74,7 +74,7 @@ Section: misc
 Priority: optional
 Architecture: amd64
 Installed-Size: $TAILLE
-Depends: python3 (>= 3.9), python3-tk, python3-pil, python3-pil.imagetk, espeak-ng, alsa-utils, fonts-dejavu-core, python3-onnxruntime | python3 (<< 3.13)
+Depends: python3 (>= 3.9), python3-tk, python3-pil, python3-pil.imagetk, espeak-ng, alsa-utils, fonts-dejavu-core, libx11-6, libxi6, python3-onnxruntime | python3 (<< 3.13)
 Recommends: python3-onnxruntime, xdg-user-dirs
 Maintainer: Jean-Baptiste Andrivet <146567424+jbandrivet@users.noreply.github.com>
 Description: Parler avec des symboles, sans lire ni écrire

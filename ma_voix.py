@@ -11,6 +11,7 @@ Les réglages de l'aidant s'ouvrent avec Ctrl+Maj+A, ou en restant appuyé
 """
 import array
 import atexit
+import ctypes
 import fcntl
 import hashlib
 import importlib.util
@@ -29,10 +30,11 @@ import time
 import urllib.parse
 import urllib.request
 import wave
+from ctypes import POINTER, byref, c_double, c_char_p, c_int, c_ubyte, c_uint, c_ulong, c_void_p
 from functools import lru_cache
 from io import BytesIO
 
-VERSION = "1.4"
+VERSION = "1.5"
 NOM_PAQUET = "ma-voix"
 
 DEPOT = "jbandrivet/ma-voix"
@@ -420,7 +422,7 @@ def degrade(w, h, haut, bas):
 @lru_cache(maxsize=48)
 def forme(w, h, rayon, onglet):
     """Masque du bouton, arrondi ; un dossier porte un onglet en haut à gauche."""
-    k = 3
+    k = 3 if w * h < 700_000 else 1     # un grand masque en 3x prend une seconde sur une vieille tablette
     m = Image.new("L", (w * k, h * k), 0)
     d = ImageDraw.Draw(m)
     if onglet:
@@ -429,7 +431,7 @@ def forme(w, h, rayon, onglet):
         d.rounded_rectangle((0, 0, int(w * 0.42) * k, (o + rayon * 2) * k), rayon * k, fill=255)
     else:
         d.rounded_rectangle((0, 0, w * k - 1, h * k - 1), rayon * k, fill=255)
-    return m.resize((w, h), Image.LANCZOS)
+    return m.resize((w, h), Image.LANCZOS) if k > 1 else m
 
 
 @lru_cache(maxsize=160)
@@ -494,7 +496,9 @@ def rendu_case(item, w, h, actif=False, texte=None):
     m = forme(bw, bh, rayon, dossier)
     fond_ombre = Image.new("L", (w, h), 0)
     fond_ombre.paste(m, (ombre, ombre))
-    fond_ombre = fond_ombre.filter(ImageFilter.GaussianBlur(3)).point(lambda v: v * 3 // 8)
+    if w * h < 700_000:
+        fond_ombre = fond_ombre.filter(ImageFilter.GaussianBlur(3))
+    fond_ombre = fond_ombre.point(lambda v: v * 3 // 8)
     im.paste((60, 45, 30, 255), (0, 0), fond_ombre)
 
     im.paste(rgb(ORANGE) if actif else rgb(BORD) if not dossier else (168, 120, 60), (0, 0), m)
@@ -559,6 +563,152 @@ import tkinter as tk  # noqa: E402
 from tkinter import messagebox, ttk  # noqa: E402
 
 
+# ---------------------------------------------------------------- toucher
+
+# Sous Wayland, GNOME écoute les touchers sur le cadre des fenêtres X11. Un programme Tk ne
+# reçoit donc que les déplacements du doigt, jamais l'appui. On demande les touchers avec
+# XInput 2 sur la fenêtre de Tk, devant le cadre, et on les transforme en clics pour Tk.
+# Si quelque chose manque, on ne fait rien : la souris et le reste marchent comme avant.
+
+XI_TOUCH_BEGIN, XI_TOUCH_UPDATE, XI_TOUCH_END = 18, 19, 20
+XI_ALL_MASTER_DEVICES = 1
+DOIGT_PERDU = 8.0       # s : plus long que l'appui de 5 s qui ouvre les réglages
+GENERIC_EVENT = 35
+BOUTON1 = 0x100
+
+
+class XIEventMask(ctypes.Structure):
+    _fields_ = [("deviceid", c_int), ("mask_len", c_int), ("mask", POINTER(c_ubyte))]
+
+
+class XGenericEventCookie(ctypes.Structure):
+    _fields_ = [("type", c_int), ("serial", c_ulong), ("send_event", c_int), ("display", c_void_p),
+                ("extension", c_int), ("evtype", c_int), ("cookie", c_uint), ("data", c_void_p)]
+
+
+class XEvent(ctypes.Union):
+    _fields_ = [("type", c_int), ("xcookie", XGenericEventCookie), ("pad", ctypes.c_long * 24)]
+
+
+class XIDeviceEvent(ctypes.Structure):
+    _fields_ = [("type", c_int), ("serial", c_ulong), ("send_event", c_int), ("display", c_void_p),
+                ("extension", c_int), ("evtype", c_int), ("time", c_ulong), ("deviceid", c_int),
+                ("sourceid", c_int), ("detail", c_int), ("root", c_ulong), ("event", c_ulong),
+                ("child", c_ulong), ("root_x", c_double), ("root_y", c_double),
+                ("event_x", c_double), ("event_y", c_double), ("flags", c_int)]
+
+
+class Tactile:
+    def __init__(self, root):
+        self.root = root
+        self.doigt = None       # le premier doigt posé ; les autres sont ignorés
+        self.depuis = 0.0
+        self.cible = None
+        self.actif = False
+        try:
+            self._brancher()
+        except (OSError, AttributeError, TypeError, tk.TclError) as e:
+            print("tactile :", e, file=sys.stderr)
+
+    def _brancher(self):
+        x = ctypes.CDLL("libX11.so.6")
+        xi = ctypes.CDLL("libXi.so.6")
+        x.XOpenDisplay.restype = c_void_p
+        x.XOpenDisplay.argtypes = [c_char_p]
+        x.XQueryExtension.argtypes = [c_void_p, c_char_p, POINTER(c_int), POINTER(c_int), POINTER(c_int)]
+        x.XSync.argtypes = [c_void_p, c_int]
+        x.XPending.argtypes = [c_void_p]
+        x.XNextEvent.argtypes = [c_void_p, POINTER(XEvent)]
+        x.XGetEventData.argtypes = [c_void_p, POINTER(XGenericEventCookie)]
+        x.XFreeEventData.argtypes = [c_void_p, POINTER(XGenericEventCookie)]
+        x.XConnectionNumber.argtypes = [c_void_p]
+        xi.XIQueryVersion.argtypes = [c_void_p, POINTER(c_int), POINTER(c_int)]
+        xi.XISelectEvents.argtypes = [c_void_p, c_ulong, POINTER(XIEventMask), c_int]
+        self.x = x
+        d = self.d = x.XOpenDisplay(None)
+        if not d:
+            raise OSError("pas d'affichage X")
+        op, ev, er = c_int(), c_int(), c_int()
+        if not x.XQueryExtension(d, b"XInputExtension", byref(op), byref(ev), byref(er)):
+            raise OSError("pas de XInput")
+        self.opcode = op.value
+        maj, mi = c_int(2), c_int(2)
+        if xi.XIQueryVersion(d, byref(maj), byref(mi)) != 0 or (maj.value, mi.value) < (2, 2):
+            raise OSError("XInput trop ancien")
+
+        self.xi = xi
+        self.fenetres = set()
+        self.root.update_idletasks()
+        self.abonner(self.root)
+        if not self.fenetres:
+            raise OSError("abonnement refusé")
+        self.actif = True
+        # Les fenêtres de dialogue s'abonnent en s'ouvrant
+        self.root.bind_class("Toplevel", "<Map>", lambda e: self.abonner(e.widget.winfo_toplevel()), add="+")
+        self.root.tk.createfilehandler(x.XConnectionNumber(d), tk.READABLE, self._lire)
+        self._lire()
+
+    def abonner(self, fenetre):
+        """S'abonne sur la fenêtre de Tk elle-même : devant le cadre, que GNOME écoute déjà."""
+        fid = fenetre.winfo_id()
+        if fid in self.fenetres:
+            return
+        x, d = self.x, self.d
+        # Une erreur X tuerait le programme : on l'attrape le temps de s'abonner
+        erreurs = []
+        rappel = ctypes.CFUNCTYPE(c_int, c_void_p, c_void_p)(lambda _d, _e: erreurs.append(1) or 0)
+        x.XSetErrorHandler.restype = c_void_p
+        x.XSetErrorHandler.argtypes = [c_void_p]
+        ancien = x.XSetErrorHandler(ctypes.cast(rappel, c_void_p))
+        octets = (c_ubyte * 3)()
+        for t in (XI_TOUCH_BEGIN, XI_TOUCH_UPDATE, XI_TOUCH_END):
+            octets[t >> 3] |= 1 << (t & 7)
+        masque = XIEventMask(XI_ALL_MASTER_DEVICES, 3, ctypes.cast(octets, POINTER(c_ubyte)))
+        self.xi.XISelectEvents(d, fid, byref(masque), 1)
+        x.XSync(d, 0)
+        x.XSetErrorHandler(ancien)
+        if not erreurs:
+            self.fenetres.add(fid)
+
+    def _lire(self, *_):
+        x, d = self.x, self.d
+        while x.XPending(d):
+            e = XEvent()
+            x.XNextEvent(d, byref(e))
+            c = e.xcookie
+            if c.type == GENERIC_EVENT and c.extension == self.opcode and x.XGetEventData(d, byref(c)):
+                t = ctypes.cast(c.data, POINTER(XIDeviceEvent)).contents
+                self._toucher(c.evtype, t.detail, int(t.root_x), int(t.root_y))
+                x.XFreeEventData(d, byref(c))
+
+    def _toucher(self, quoi, doigt, rx, ry):
+        maintenant = time.monotonic()
+        if quoi == XI_TOUCH_BEGIN and self.doigt is not None and maintenant - self.depuis > DOIGT_PERDU:
+            self.doigt = self.cible = None      # sa fin s'est perdue : il ne doit pas tout bloquer
+        if doigt == self.doigt:
+            self.depuis = maintenant
+        if quoi == XI_TOUCH_BEGIN and self.doigt is None:
+            w = self.root.winfo_containing(rx, ry)
+            if w is None:
+                return
+            self.doigt, self.cible, self.depuis = doigt, w, maintenant
+            self._envoyer("<Motion>", rx, ry, 0)
+            self._envoyer("<ButtonPress-1>", rx, ry, 0)
+        elif doigt == self.doigt and quoi == XI_TOUCH_UPDATE:
+            self._envoyer("<Motion>", rx, ry, BOUTON1)
+        elif doigt == self.doigt and quoi == XI_TOUCH_END:
+            self._envoyer("<ButtonRelease-1>", rx, ry, BOUTON1)
+            self.doigt = self.cible = None
+
+    def _envoyer(self, sequence, rx, ry, etat):
+        w = self.cible
+        try:
+            w.event_generate(sequence, x=rx - w.winfo_rootx(), y=ry - w.winfo_rooty(),
+                             rootx=rx, rooty=ry, state=etat)
+        except tk.TclError:             # le widget a disparu entre-temps
+            self.doigt = self.cible = None
+
+
 def style_human(root):
     st = ttk.Style(root)
     st.theme_use("clam")
@@ -599,6 +749,8 @@ class Appli:
         self._ico = ImageTk.PhotoImage(icone(64))
         self.root.iconphoto(True, self._ico)
         style_human(self.root)
+        self.root.update_idletasks()
+        self.tactile = Tactile(self.root)
         self.canvas = tk.Canvas(self.root, bg=BG, highlightthickness=0, cursor="hand2")
         self.canvas.pack(fill="both", expand=True)
 
@@ -763,6 +915,7 @@ class Appli:
         self._annuler_scan()
         self._attente_zero()
         self.confirmation = True
+        self.voix.dire(phrase(it, self.r), alarme=bool(it.get("alarme")))   # avant de dessiner : la voix d'abord
         W, H, bh, m, *_ = self.geometrie()
         self.canvas.delete("all")
         self.ids, self.marques = {}, []
@@ -776,7 +929,6 @@ class Appli:
         rendu.pop("page", None)
         self.photos["grand"] = ImageTk.PhotoImage(self.dessin(rendu, cw, ch))
         self.canvas.create_image(m, bh + m, anchor="nw", image=self.photos["grand"])
-        self.voix.dire(phrase(it, self.r), alarme=bool(it.get("alarme")))
         if not it.get("alarme"):        # l'alarme reste à l'écran jusqu'à l'appui sur la maison
             self.limite_voix = time.monotonic() + 30
             self.root.after(100, self._attendre_voix)

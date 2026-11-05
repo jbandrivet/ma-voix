@@ -20,7 +20,7 @@ Pour Ubuntu ou Debian sur un PC 64 bits. Voir [comment l'installer](#installer).
 
 ### Quatre façons de choisir
 
-1. En touchant ou en cliquant sur le symbole.
+1. En touchant ou en cliquant sur le symbole. Le tactile marche aussi sous GNOME avec Wayland, où les logiciels Tk ne reçoivent normalement pas l'appui du doigt.
 2. En restant sur le symbole, sans cliquer (souris à la tête, regard).
 3. Avec **un seul contact** : le cadre orange défile tout seul.
 4. Avec deux contacts : un pour avancer, un pour choisir.
